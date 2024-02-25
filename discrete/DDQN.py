@@ -144,8 +144,14 @@ class DDQN(object):
 		torch.save(self.Q_optimizer.state_dict(), filename + "optimizer")
 
 
-	def load(self, filename):
-		self.iterations = torch.load(filename + "iterations")
-		self.Q.load_state_dict(torch.load(f"{filename}Q_{self.iterations}"))
-		self.Q_target = copy.deepcopy(self.Q)
-		self.Q_optimizer.load_state_dict(torch.load(filename + "optimizer"))
+	def load(self, filename, iters):
+		if torch.cuda.is_available():
+			self.iterations = torch.load(filename + "iterations")
+			self.Q.load_state_dict(torch.load(f"{filename}Q_{iters}"))
+			self.Q_target = copy.deepcopy(self.Q)
+			self.Q_optimizer.load_state_dict(torch.load(filename + "optimizer"))
+		else:
+			self.iterations = torch.load(filename + "iterations", map_location=torch.device('cpu'))
+			self.Q.load_state_dict(torch.load(f"{filename}Q_{iters}", map_location=torch.device('cpu')))
+			self.Q_target = copy.deepcopy(self.Q)
+			self.Q_optimizer.load_state_dict(torch.load(filename + "optimizer", map_location=torch.device('cpu')))

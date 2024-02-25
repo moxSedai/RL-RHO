@@ -63,7 +63,12 @@ class PrioritizedAtariBuffer(object):
 			self.tree.set(self.ptr, self.max_priority)
 
 
-	def sample(self):
+	def sample(self, size_override=None):
+
+		old_size = self.batch_size
+		if size_override is not None:
+			self.batch_size = size_override
+
 		ind = self.tree.sample(self.batch_size) if self.prioritized \
 			else np.random.randint(0, self.size, size=self.batch_size)
 
@@ -94,19 +99,34 @@ class PrioritizedAtariBuffer(object):
 			next_not_done *= state_not_done
 			state_not_done *= (1. - self.first_timestep[j]).reshape(-1, 1, 1)
 
-		batch = (
-			torch.ByteTensor(state).to(self.device).float(),
-			torch.LongTensor(self.action[ind]).to(self.device),
-			torch.ByteTensor(next_state).to(self.device).float(),
-			torch.FloatTensor(self.reward[ind]).to(self.device),
-			torch.FloatTensor(self.not_done[ind]).to(self.device)
-		)
+
+		if size_override is None:
+			batch = (
+				torch.ByteTensor(state).to(self.device).float(),
+				torch.LongTensor(self.action[ind]).to(self.device),
+				torch.ByteTensor(next_state).to(self.device).float(),
+				torch.FloatTensor(self.reward[ind]).to(self.device),
+				torch.FloatTensor(self.not_done[ind]).to(self.device)
+			)
+		else:
+			batch = (
+				torch.ByteTensor(state).to(self.device).float(),
+				torch.LongTensor(self.action[ind]).to(self.device),
+				torch.ByteTensor(next_state).to(self.device).float(),
+				torch.FloatTensor(self.reward[ind]).to(self.device),
+				torch.FloatTensor(self.not_done[ind]).to(self.device),
+				torch.FloatTensor(self.first_timestep[ind]).to(self.device)
+			)
+
 
 		if self.prioritized:
 			weights = np.array(self.tree.nodes[-1][ind]) ** -self.beta
 			weights /= weights.max()
 			self.beta = min(self.beta + 4.8e-8, 1) # Hardcoded: 0.4 + 4.8e-8 * 12.5e6 = 1.0. Only used by PER.
 			batch += (ind, torch.FloatTensor(weights).to(self.device).reshape(-1, 1))
+
+		if size_override is not None:
+			self.batch_size = old_size
 
 		return batch
 
@@ -154,17 +174,31 @@ class PrioritizedStandardBuffer():
 		self.size = min(self.size + 1, self.max_size)
 
 
-	def sample(self):
+	def sample(self, override_size=None):
+		old_size = self.batch_size
+		if override_size is not None:
+			self.batch_size = override_size
+
 		ind = self.tree.sample(self.batch_size) if self.prioritized \
 			else np.random.randint(0, self.size, size=self.batch_size)
 
-		batch = (
-			torch.FloatTensor(self.state[ind]).to(self.device),
-			torch.LongTensor(self.action[ind]).to(self.device),
-			torch.FloatTensor(self.next_state[ind]).to(self.device),
-			torch.FloatTensor(self.reward[ind]).to(self.device),
-			torch.FloatTensor(self.not_done[ind]).to(self.device)
-		)
+		if override_size is None:
+			batch = (
+				torch.FloatTensor(self.state[ind]).to(self.device),
+				torch.LongTensor(self.action[ind]).to(self.device),
+				torch.FloatTensor(self.next_state[ind]).to(self.device),
+				torch.FloatTensor(self.reward[ind]).to(self.device),
+				torch.FloatTensor(self.not_done[ind]).to(self.device)
+			)
+		else:
+			batch = (
+				torch.FloatTensor(self.state[ind]).to(self.device),
+				torch.LongTensor(self.action[ind]).to(self.device),
+				torch.FloatTensor(self.next_state[ind]).to(self.device),
+				torch.FloatTensor(self.reward[ind]).to(self.device),
+				torch.FloatTensor(self.not_done[ind]).to(self.device),
+				torch.zeros(ind.shape).to(self.device)
+			)
 
 		if self.prioritized:
 			weights = np.array(self.tree.nodes[-1][ind]) ** -self.beta
@@ -172,6 +206,8 @@ class PrioritizedStandardBuffer():
 			self.beta = min(self.beta + 2e-7, 1) # Hardcoded: 0.4 + 2e-7 * 3e6 = 1.0. Only used by PER.
 			batch += (ind, torch.FloatTensor(weights).to(self.device).reshape(-1, 1))
 
+		if override_size is not None:
+			self.batch_size = old_size
 		return batch
 
 
@@ -286,7 +322,7 @@ class AtariPreprocessing(object):
 		self.episode_length += 1
 
 		for frame in range(self.frame_skip):
-			_, reward, done, _ = self.env.step(action)
+			_, reward, done, _, _ = self.env.step(action)
 			total_reward += reward
 
 			if self.done_on_life_loss:
@@ -334,10 +370,12 @@ class AtariPreprocessing(object):
 
 
 # Create environment, add wrapper if necessary and create env_properties
-def make_env(env_name, atari_preprocessing):
-	env = gym.make(env_name)
+def make_env(env_name, atari_preprocessing, render_mode=None):
+	env = gym.make(env_name, render_mode=render_mode)
 	
-	is_atari = gym.envs.registry.spec(env_name).entry_point == 'gym.envs.atari:AtariEnv'
+	#is_atari = gym.envs.registry.spec(env_name).entry_point == 'gym.envs.atari:AtariEnv'
+	is_atari = (gym.envs.registry[env_name].entry_point == 'gym.envs.atari:AtariEnv' or
+				gym.envs.registry[env_name].entry_point == 'ale_py.env.gym:AtariEnv')
 	env = AtariPreprocessing(env, **atari_preprocessing) if is_atari else env
 
 	state_dim = (
