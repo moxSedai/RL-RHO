@@ -4,11 +4,14 @@ import importlib
 import json
 import os
 import random
+import sys
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
 import numpy as np
 import torch
+
+import logging
 
 import DDQN
 import PER_DDQN
@@ -17,14 +20,31 @@ import PAL_DDQN
 import utils
 
 
+# Class to log print statements
+class PrintToLog:
+
+	def __init__(self):
+		self.terminal = sys.__stdout__
+	def write(self, text):
+		logging.info(text)
+		self.terminal.write(text)
+
+	def flush(self):
+		pass
+
+
 def coreset(policy, holdout_policy, replay_buffer, holdout_buffer, coreset_base, coreset_size, coreset_batch_size, add_count, args, kwargs):
+	# Create a deep copy of the coreset_base which is an empty replay buffer
 	coreset = copy.deepcopy(coreset_base)	# I don't understand how the buffers actually work so I'm just copying through an empty one all the time
+	# Initialize a set to store unique experiences for the coreset
 	coreset_set = set()
 
-	# PERCENTAGE CORESET SIZE
-	coreset_size = int(replay_buffer.size / 2)
+	# Convert the coreset_size from a percentage to an absolute number based on the size of the replay buffer
+	coreset_size = int(replay_buffer.size * coreset_size)
+
+	# Keep adding experiences to the coreset until it reaches the desired size
 	while(len(coreset_set) < coreset_size):
-		# Sample replay buffer
+		# Sample a batch of experiences from the replay buffer
 		state, action, next_state, reward, done, first_timestep = replay_buffer.sample(coreset_batch_size)
 
 		# Compute the target Q value for the main policy
@@ -40,38 +60,38 @@ def coreset(policy, holdout_policy, replay_buffer, holdout_buffer, coreset_base,
 			holdout_next_action = holdout_policy.Q(next_state).argmax(1, keepdim=True)
 			holdout_target_Q = (
 					reward + done * holdout_policy.discount *
-					holdout_policy.Q_target(next_state).gather(1, next_action).reshape(-1, 1)
+					holdout_policy.Q_target(next_state).gather(1, holdout_next_action).reshape(-1, 1)
 			)
 
-
-		# Get current Q estimate for policy
+		# Compute the current Q estimate for the main policy
 		current_Q = policy.Q(state).gather(1, action)
-
-		# td_loss = (current_Q - target_Q).abs()
 		Q_loss = F.smooth_l1_loss(current_Q, target_Q, reduce=False)
+		# td_loss = (current_Q - target_Q).abs()
 		# weight = td_loss.clamp(min=policy.min_priority).pow(policy.alpha).mean().detach()
-
 		# Compute critic loss
 		# Q_loss = policy.PAL(td_loss) / weight.detach()
 
 
-		# Get current Q estimate for holdout policy
+		# Compute the current Q estimate for the holdout policy
 		holdout_current_Q = holdout_policy.Q(state).gather(1, action)
-
-		# holdout_td_loss = (holdout_current_Q - holdout_target_Q).abs()
 		holdout_Q_loss = F.smooth_l1_loss(holdout_current_Q, holdout_target_Q, reduce=False)
+		# holdout_td_loss = (holdout_current_Q - holdout_target_Q).abs()
 		# holdout_weight = td_loss.clamp(min=holdout_policy.min_priority).pow(holdout_policy.alpha).mean().detach()
-
 		# Compute critic loss
 		# holdout_Q_loss = holdout_policy.PAL(td_loss) / weight.detach()
-
 		# Compute RHO loss
 		# rho_loss = td_loss - holdout_td_loss
+
+		# Compute the difference between the Q losses of the main policy and the holdout policy
 		rho_loss = Q_loss - holdout_Q_loss
+
+		# Sort the experiences based on the rho_loss in descending order
 		order = torch.argsort(rho_loss, 0).flip(0)
+
+		# Determine the number of experiences to add to the coreset in this iteration
 		num_to_add = min(coreset_size - len(coreset_set), add_count)
 
-		# Add the top num_to_add elements to the coreset
+		# Add the top num_to_add experiences to the coreset_set (don't allow for duplicates)
 		for i in range(num_to_add):
 			coreset_set.add((state[order[i]], action[order[i]], next_state[order[i]], reward[order[i]], done[order[i]], done[order[i]], first_timestep[order[i]]))
 
@@ -162,6 +182,8 @@ def normal_training(env, replay_buffer, args, kwargs):
 	plt.scatter(range(len(evaluations)), evaluations, title="Normal Training Evaluation Rewards over epochs")
 
 
+
+
 def rho_training(env, replay_buffer, holdout_replay_buffer, coreset_base, coreset_freq, coreset_size, coreset_batch_size, coreset_add_size, args, kwargs):
 	# Setup for training
 	policy = DDQN.DDQN(**kwargs)
@@ -180,16 +202,28 @@ def rho_training(env, replay_buffer, holdout_replay_buffer, coreset_base, corese
 	episode_timesteps = 0
 	episode_num = 0
 
+	its_holdout = 0
+	its_main = 0
+
 	# Interact with the environment for max_timesteps
 	for t in range(int(args.max_timesteps)):
 		# Everything here is normal
 		episode_timesteps += 1
 
+		# Get value to split between main and holdout policy
+		if random.randint(0, 4) != 0:
+			holdout = False
+			policy_used = policy
+		else:
+			holdout = True
+			policy_used = holdout_policy
+
+
 		# if args.train_behavioral:
 		if t < parameters["start_timesteps"]:
 			action = env.action_space.sample()
 		else:
-			action = policy.select_action(np.array(state))
+			action = policy_used.select_action(np.array(state))
 
 		# Perform action and log results
 		if (hasattr(env, 'spec')):
@@ -207,7 +241,7 @@ def rho_training(env, replay_buffer, holdout_replay_buffer, coreset_base, corese
 			done_float = info[1]
 
 		# Now deal with holdout vs main policy
-		if random.randint(0, 4) != 0:
+		if not holdout:
 			# ============================================================ #
 			# ========== Train on normal policy 80% of the time ========== #
 			# ============================================================ #
@@ -217,8 +251,10 @@ def rho_training(env, replay_buffer, holdout_replay_buffer, coreset_base, corese
 			state = copy.copy(next_state)
 			episode_start = False
 
+			its_main += 1
+
 			# Train agent after collecting sufficient data
-			if t >= parameters["start_timesteps"] and (t + 1) % parameters["train_freq"] == 0:
+			if its_main >= parameters["start_timesteps"] and (its_main + 1) % parameters["train_freq"] == 0:
 				policy.train(replay_buffer)
 
 		else:
@@ -230,8 +266,10 @@ def rho_training(env, replay_buffer, holdout_replay_buffer, coreset_base, corese
 			state = copy.copy(next_state)
 			episode_start = False
 
+			its_holdout += 1
+
 			# Train agent after collecting sufficient data
-			if t >= parameters["start_timesteps"] and (t + 1) % parameters["train_freq"] == 0:
+			if its_holdout >= parameters["start_timesteps"] and (its_holdout + 1) % parameters["train_freq"] == 0:
 				holdout_policy.train(holdout_replay_buffer)
 
 		# Back to normal
@@ -260,7 +298,6 @@ def rho_training(env, replay_buffer, holdout_replay_buffer, coreset_base, corese
 			print(f"======================Created coreset at timestep {t}======================")
 
 	plt.scatter(range(len(evaluations)), evaluations, title="Rho Training Evaluation Rewards over epochs")
-
 
 
 def main(env, replay_buffer, is_atari, state_dim, num_actions, args, parameters, device, rho_buffer=None, coreset_base=None, coreset_freq=None,  coreset_size=None, coreset_batch_size=None, coreset_add_size=None):
@@ -317,11 +354,18 @@ def eval_policy(policy, env_name, seed, eval_episodes=10):
 
 
 if __name__ == "__main__":
+	# Initialize logger
+	logger = logging.getLogger(__name__)
+	logging.basicConfig(filename='main.log', level=logging.DEBUG)
+	logger.info("Starting main.py")
+	sys.stdout = PrintToLog()
+
+	# Set Rho Parameters
 	rho = True
-	coreset_size = 500
+	coreset_size = 1.0
 	coreset_batch_size = 512
 	coreset_add_size = 16
-	coreset_freq = 1000
+	coreset_freq = 5000
 
 	# Atari Specific
 	atari_preprocessing = {
