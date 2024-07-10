@@ -63,7 +63,9 @@ class PrioritizedAtariBuffer(object):
 			self.tree.set(self.ptr, self.max_priority)
 
 
-	def sample(self, size_override=None):
+	def sample(self, size_override=None, with_indices = False):
+		if with_indices:
+			indices = []
 
 		old_size = self.batch_size
 		if size_override is not None:
@@ -90,6 +92,9 @@ class PrioritizedAtariBuffer(object):
 				# If j == -1, then we set state_not_done to 0.
 				state_not_done *= (j + 1).clip(min=0, max=1).reshape(-1, 1, 1)
 				j = j.clip(min=0)
+
+			if with_indices:
+				indices.append(j)
 
 			# State should be all 0s if the episode terminated previously
 			state[:, i] = self.state[j] * state_not_done
@@ -128,6 +133,8 @@ class PrioritizedAtariBuffer(object):
 		if size_override is not None:
 			self.batch_size = old_size
 
+		if with_indices:
+			return batch, indices
 		return batch
 
 
@@ -159,6 +166,12 @@ class PrioritizedStandardBuffer():
 			self.max_priority = 1.0
 			self.beta = 0.4
 
+	def __repr__(self):
+		return_string = ""
+		for i in range(self.size):
+			return_string += f"{self.state[i]} {self.action[i]} {self.next_state[i]} {self.reward[i]} {self.not_done[i]}\n"
+
+		return return_string
 
 	def add(self, state, action, next_state, reward, done, env_done, first_timestep):
 		self.state[self.ptr] = state
@@ -173,11 +186,15 @@ class PrioritizedStandardBuffer():
 		self.ptr = (self.ptr + 1) % self.max_size
 		self.size = min(self.size + 1, self.max_size)
 
+	def print(self):
+		for i in range(self.size):
+			print(self.state[i], self.action[i], self.next_state[i], self.reward[i], self.not_done[i])
 
-	def sample(self, override_size=None):
+	def sample(self, override_size=None, with_indices=False):
 		old_size = self.batch_size
 		if override_size is not None:
 			self.batch_size = override_size
+
 
 		ind = self.tree.sample(self.batch_size) if self.prioritized \
 			else np.random.randint(0, self.size, size=self.batch_size)
@@ -208,6 +225,9 @@ class PrioritizedStandardBuffer():
 
 		if override_size is not None:
 			self.batch_size = old_size
+
+		if with_indices:
+			return batch, ind
 		return batch
 
 

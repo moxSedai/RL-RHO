@@ -7,6 +7,7 @@ import random
 import sys
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
+import time
 
 import numpy as np
 import torch
@@ -37,15 +38,16 @@ def coreset(policy, holdout_policy, replay_buffer, holdout_buffer, coreset_base,
 	# Create a deep copy of the coreset_base which is an empty replay buffer
 	coreset = copy.deepcopy(coreset_base)	# I don't understand how the buffers actually work so I'm just copying through an empty one all the time
 	# Initialize a set to store unique experiences for the coreset
-	coreset_set = set()
+	coreset_indices_set = set()
 
 	# Convert the coreset_size from a percentage to an absolute number based on the size of the replay buffer
 	coreset_size = int(replay_buffer.size * coreset_size)
 
 	# Keep adding experiences to the coreset until it reaches the desired size
-	while(len(coreset_set) < coreset_size):
+	while(len(coreset_indices_set) < coreset_size):
 		# Sample a batch of experiences from the replay buffer
-		state, action, next_state, reward, done, first_timestep = replay_buffer.sample(coreset_batch_size)
+		sample, indices = replay_buffer.sample(coreset_batch_size, with_indices=True)
+		state, action, next_state, reward, done, first_timestep = sample
 
 		# Compute the target Q value for the main policy
 		with torch.no_grad():
@@ -83,20 +85,25 @@ def coreset(policy, holdout_policy, replay_buffer, holdout_buffer, coreset_base,
 		# rho_loss = td_loss - holdout_td_loss
 
 		# Compute the difference between the Q losses of the main policy and the holdout policy
-		rho_loss = Q_loss - holdout_Q_loss
+		rho_loss = holdout_Q_loss - Q_loss
 
 		# Sort the experiences based on the rho_loss in descending order
 		order = torch.argsort(rho_loss, 0).flip(0)
 
 		# Determine the number of experiences to add to the coreset in this iteration
-		num_to_add = min(coreset_size - len(coreset_set), add_count)
+		num_to_add = min(coreset_size - len(coreset_indices_set), add_count)
 
-		# Add the top num_to_add experiences to the coreset_set (don't allow for duplicates)
-		for i in range(num_to_add):
-			coreset_set.add((state[order[i]], action[order[i]], next_state[order[i]], reward[order[i]], done[order[i]], done[order[i]], first_timestep[order[i]]))
+		# Add the top num_to_add un-added experiences to the coreset_set (don't allow for duplicates)
+		i, added = 0, 0
+		while added < num_to_add and i < len(order):
+			if not indices[order[i]] in coreset_indices_set:
+				added += 1
+				coreset_indices_set.add(indices[order[i]])
+				coreset.add(state[order[i]].cpu().numpy(), action[order[i]].cpu().numpy(), next_state[order[i]].cpu().numpy(), reward[order[i]].cpu().numpy(), 1-done[order[i]].cpu().numpy(), 1-done[order[i]].cpu().numpy(), first_timestep[order[i]].cpu().numpy())
+			i += 1
 
-	for elm in coreset_set:
-		coreset.add(elm[0].cpu().numpy(), elm[1].cpu().numpy(), elm[2].cpu().numpy(), elm[3].cpu().numpy(), elm[4].cpu().numpy(), elm[5].cpu().numpy(), elm[6].cpu().numpy())
+	# for elm in coreset_set:
+	# 	coreset.add(elm[0].cpu().numpy(), elm[1].cpu().numpy(), elm[2].cpu().numpy(), elm[3].cpu().numpy(), elm[4].cpu().numpy(), elm[5].cpu().numpy(), elm[6].cpu().numpy())
 
 	return copy.deepcopy(coreset), copy.deepcopy(coreset)
 
@@ -125,6 +132,8 @@ def normal_training(env, replay_buffer, args, kwargs):
 	episode_reward = 0
 	episode_timesteps = 0
 	episode_num = 0
+
+	start_time = time.time()
 
 	# Interact with the environment for max_timesteps
 	for t in range(int(args.max_timesteps)):
@@ -176,15 +185,17 @@ def normal_training(env, replay_buffer, args, kwargs):
 
 		# Evaluate episode
 		if (t + 1) % parameters["eval_freq"] == 0:
-			evaluations.append(eval_policy(policy, args.env, args.seed))
+			elapsed_time = time.time() - start_time
+			evaluations.append(eval_policy(policy, args.env, args.seed, timer=elapsed_time))
 			np.save(f"./results/{setting}.npy", evaluations)
 			policy.save(f"./results/policyThingyPong")
-	plt.scatter(range(len(evaluations)), evaluations, title="Normal Training Evaluation Rewards over epochs")
+	plt.scatter(range(len(evaluations)), evaluations)
+	plt.title(f"Normal Training Evaluation Rewards over epochs {time.time() - start_time}")
+	plt.show()
 
 
 
-
-def rho_training(env, replay_buffer, holdout_replay_buffer, coreset_base, coreset_freq, coreset_size, coreset_batch_size, coreset_add_size, args, kwargs):
+def rho_training(env, replay_buffer, holdout_replay_buffer, coreset_base, coreset_freq, coreset_size, coreset_batch_size, coreset_add_size, args, kwargs, name=''):
 	# Setup for training
 	policy = DDQN.DDQN(**kwargs)
 	holdout_policy = DDQN.DDQN(**kwargs)
@@ -204,6 +215,9 @@ def rho_training(env, replay_buffer, holdout_replay_buffer, coreset_base, corese
 
 	its_holdout = 0
 	its_main = 0
+
+	# Start timer
+	start_time = time.time()
 
 	# Interact with the environment for max_timesteps
 	for t in range(int(args.max_timesteps)):
@@ -272,6 +286,10 @@ def rho_training(env, replay_buffer, holdout_replay_buffer, coreset_base, corese
 			if its_holdout >= parameters["start_timesteps"] and (its_holdout + 1) % parameters["train_freq"] == 0:
 				holdout_policy.train(holdout_replay_buffer)
 
+		if hasattr(env, 'spec'):
+			if episode_timesteps > env.spec.max_episode_steps:
+				done = True
+
 		# Back to normal
 		if done:
 			# +1 to account for 0 indexing. +0 on ep_timesteps since it will increment +1 even if done=True
@@ -288,16 +306,22 @@ def rho_training(env, replay_buffer, holdout_replay_buffer, coreset_base, corese
 
 		# Evaluate episode
 		if (t + 1) % parameters["eval_freq"] == 0:
-			evaluations.append(eval_policy(policy, args.env, args.seed))
+			elapsed_time = time.time() - start_time
+			evaluations.append(eval_policy(policy, args.env, args.seed, timer=elapsed_time))
 			np.save(f"./results/{setting}.npy", evaluations)
 			policy.save(f"./results/policyThingyPong")
 
 		# Create coreset
 		if t % coreset_freq == 0:
+			# print(replay_buffer)
 			replay_buffer, holdout_replay_buffer = coreset(policy, holdout_policy, replay_buffer, holdout_replay_buffer, coreset_base, coreset_size, coreset_batch_size, coreset_add_size, args, kwargs)
+
+			# print(replay_buffer)
 			print(f"======================Created coreset at timestep {t}======================")
 
-	plt.scatter(range(len(evaluations)), evaluations, title="Rho Training Evaluation Rewards over epochs")
+	plt.scatter(range(len(evaluations)), evaluations)
+	plt.title(f"Rho Training Evaluation Rewards over epochs {name} {time.time()-start_time}")
+	plt.show()
 
 
 def main(env, replay_buffer, is_atari, state_dim, num_actions, args, parameters, device, rho_buffer=None, coreset_base=None, coreset_freq=None,  coreset_size=None, coreset_batch_size=None, coreset_add_size=None):
@@ -322,18 +346,19 @@ def main(env, replay_buffer, is_atari, state_dim, num_actions, args, parameters,
 	if not rho:
 		normal_training(env, replay_buffer, args, kwargs)
 	else:
-		rho_training(env, replay_buffer, rho_buffer, coreset_base, coreset_freq, coreset_size, coreset_batch_size, coreset_add_size, args, kwargs)
+		rho_training(env, replay_buffer, rho_buffer, coreset_base, coreset_freq, coreset_size, coreset_batch_size, coreset_add_size, args, kwargs, f"{coreset_freq} {coreset_size}")
 
 
 # Runs policy for X episodes and returns average reward
 # A fixed seed is used for the eval environment
-def eval_policy(policy, env_name, seed, eval_episodes=10):
+def eval_policy(policy, env_name, seed, eval_episodes=10, timer=0.0):
 	eval_env, _, _, _ = utils.make_env(env_name, atari_preprocessing)
 	if hasattr(env, 'seed'):
 		eval_env.seed(seed + 100)
 
 	avg_reward = 0.
 	for _ in range(eval_episodes):
+		cur_reward = 0
 		state, done = eval_env.reset(), False
 		if not isinstance(state, list) or not isinstance(state, np.ndarray):
 			state = state[0]
@@ -341,6 +366,9 @@ def eval_policy(policy, env_name, seed, eval_episodes=10):
 			action = policy.select_action(np.array(state), eval=True)
 			if(hasattr(eval_env, 'spec')):
 				state, reward, done, _, _ = eval_env.step(action)
+				cur_reward += reward
+				if cur_reward >= eval_env.spec.max_episode_steps:
+					done = True
 			else:
 				state, reward, done, _ = eval_env.step(action)
 			avg_reward += reward
@@ -348,7 +376,7 @@ def eval_policy(policy, env_name, seed, eval_episodes=10):
 	avg_reward /= eval_episodes
 
 	print("---------------------------------------")
-	print(f"Evaluation over {eval_episodes} episodes: {avg_reward:.3f}")
+	print(f"Evaluation over {eval_episodes} episodes: {avg_reward:.3f} {timer:3f} seconds")
 	print("---------------------------------------")
 	return avg_reward
 
@@ -362,10 +390,10 @@ if __name__ == "__main__":
 
 	# Set Rho Parameters
 	rho = True
-	coreset_size = 1.0
+	coreset_size = 0.1
 	coreset_batch_size = 512
 	coreset_add_size = 16
-	coreset_freq = 5000
+	coreset_freq = 250
 
 	# Atari Specific
 	atari_preprocessing = {
@@ -436,10 +464,10 @@ if __name__ == "__main__":
 	parser = argparse.ArgumentParser()
 	parser.add_argument("--algorithm", default="DDQN")				# OpenAI gym environment name
 	parser.add_argument("--env", default="CartPole-v1")		# OpenAI gym environment name #PongNoFrameskip-v0
-	#parser.add_argument("--env", default="PongNoFrameskip-v0")  # OpenAI gym environment name #PongNoFrameskip-v0
+	# parser.add_argument("--env", default="PongNoFrameskip-v0")  # OpenAI gym environment name #PongNoFrameskip-v0
 	parser.add_argument("--seed", default=0, type=int)				# Sets Gym, PyTorch and Numpy seeds
 	parser.add_argument("--buffer_name", default="Default")			# Prepends name to filename
-	parser.add_argument("--max_timesteps", default=50e6, type=int)	# Max time steps to run environment or train for
+	parser.add_argument("--max_timesteps", default=5e5, type=int)	# Max time steps to run environment or train for
 	args = parser.parse_args()
 
 	print("---------------------------------------")	
@@ -462,7 +490,7 @@ if __name__ == "__main__":
 	torch.manual_seed(args.seed)
 	np.random.seed(args.seed)
 
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+	device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
 
 	# Initialize buffer
@@ -500,3 +528,22 @@ if __name__ == "__main__":
 	elif not rho:
 		main(env, replay_buffer, is_atari, state_dim, num_actions, args, parameters, device)
 
+# plot reward over time (time = # steps, rather than evaluations) (done, ish)
+# compare to no coreset (done)
+# compare low coreset % to high coreset %
+	# can low coreset % be more stable but take more steps to train?
+
+
+# todo try cartpole with 10% coreset
+
+# todo read papers again
+
+# todo for pong, need to change datastructure.  Must have buffer elements be sets of 4 frames.  (Start with frames being all 0, every time a new frame is there, shift the previous frames left (deleting the 4th frame) and add the new new one to the front (AKA rolling 4-frame window) -- not necessarily 4, set to same as state history
+	# todo How to change loss to work for this?
+
+
+	# baseline for smoe seeds, then with coresetting
+# don't forget, can use both GPUs
+
+# Once everything else is done, investigate episode-wise rather than iteration-wise swaps between online and holdout
+# Also another extended goal: After training a policy with standard RL, save the buffer see if we can train a new policy with supervised learning (treat buffer as dataset)
