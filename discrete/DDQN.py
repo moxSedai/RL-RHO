@@ -85,31 +85,32 @@ class DDQN(object):
 		# Number of training iterations
 		self.iterations = 0
 
-
 	def select_action(self, state, eval=False):
 		eps = self.eval_eps if eval \
 			else max(self.slope * self.iterations + self.initial_eps, self.end_eps)
 
 		# Select action according to policy with probability (1-eps)
 		# otherwise, select random action
-		if np.random.uniform(0,1) > eps:
+		if np.random.uniform(0, 1) > eps:
 			with torch.no_grad():
 				state = torch.FloatTensor(state).reshape(self.state_shape).to(self.device)
 				return int(self.Q(state).argmax(1))
 		else:
 			return np.random.randint(self.num_actions)
 
-
 	def train(self, replay_buffer):
 		# Sample replay buffer
 		state, action, next_state, reward, done = replay_buffer.sample()
+
+		# reward = reward[:, 0]
+		# action = action[:, 0].to(torch.int64)
+		# done = done[:, 0]
 
 		# Compute the target Q value
 		with torch.no_grad():
 			next_action = self.Q(next_state).argmax(1, keepdim=True)
 			target_Q = (
-				reward + done * self.discount *
-				self.Q_target(next_state).gather(1, next_action).reshape(-1, 1)
+				reward + done * self.discount * self.Q_target(next_state).gather(1, next_action).reshape(-1, 1)
 			)
 
 		# Get current Q estimate
@@ -127,22 +128,18 @@ class DDQN(object):
 		self.iterations += 1
 		self.maybe_update_target()
 
-
 	def polyak_target_update(self):
 		for param, target_param in zip(self.Q.parameters(), self.Q_target.parameters()):
-		   target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-
+			target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
 	def copy_target_update(self):
 		if self.iterations % self.target_update_frequency == 0:
-			 self.Q_target.load_state_dict(self.Q.state_dict())
-
+			self.Q_target.load_state_dict(self.Q.state_dict())
 
 	def save(self, filename):
 		torch.save(self.iterations, filename + "iterations")
 		torch.save(self.Q.state_dict(), f"{filename}Q_{self.iterations}")
 		torch.save(self.Q_optimizer.state_dict(), filename + "optimizer")
-
 
 	def load(self, filename, iters):
 		if torch.cuda.is_available():

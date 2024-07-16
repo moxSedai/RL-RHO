@@ -2,13 +2,123 @@ import cv2
 import gym
 import numpy as np
 import torch
+import copy
 
 
 def ReplayBuffer(state_dim, prioritized, is_atari, atari_preprocessing, batch_size, buffer_size, device):
-	if is_atari: 
-		return PrioritizedAtariBuffer(state_dim, atari_preprocessing, batch_size, buffer_size, device, prioritized)
+	if is_atari:
+		return SlidingBuffer(atari_preprocessing, batch_size, buffer_size, device)
+		# return PrioritizedAtariBuffer(state_dim, atari_preprocessing, batch_size, buffer_size, device, prioritized)
 	else: 
 		return PrioritizedStandardBuffer(state_dim, batch_size, buffer_size, device, prioritized)
+
+
+class SlidingAtariBufferInstance(object):
+	def __init__(self, atari_preprocessing, device):
+		self.device = device
+
+		self.frame_count = atari_preprocessing["state_history"]
+
+		self.size = 0
+
+		self.state = np.zeros((
+			self.frame_count,
+			atari_preprocessing["frame_size"],
+			atari_preprocessing["frame_size"]
+		), dtype=np.uint8)
+
+		self.next_state = np.zeros((
+			self.frame_count,
+			atari_preprocessing["frame_size"],
+			atari_preprocessing["frame_size"]
+		), dtype=np.uint8)
+
+		self.action = 0
+		self.reward = 0
+
+		# not_done only consider "done" if episode terminates due to failure condition
+		# if episode terminates due to timelimit, the transition is not added to the buffer
+		self.not_done = 0
+		self.first_timestep = 0
+
+	def add(self, state, action, next_state, reward, done, env_done, first_timestep):
+		if done != env_done:
+			return
+
+		if len(np.shape(state)) > 2:
+			state = state[0]
+
+		self.state = np.concatenate((np.expand_dims(state, 0), self.state[:3]))
+		# self.next_state = np.concatenate((self.next_state[1:], np.expand_dims(next_state, 0)))
+
+		self.action = action
+		self.reward = reward
+		self.not_done = 1. - done
+		self.first_timestep = first_timestep
+
+
+
+class SlidingBuffer(object):
+	def __init__(self, atari_preprocessing, batch_size, buffer_size, device):
+		self.curBufferInstance = SlidingAtariBufferInstance(atari_preprocessing, device)
+		self.buffer = []
+
+		self.batch_size = batch_size
+		self.buffer_size = buffer_size
+
+		self.size = 0
+
+		self.device = device
+
+		self.atari_preprocessing = atari_preprocessing
+
+	# todo MAKE SURE THIS DOESN'T BREAK THINGS!
+	def __copy__(self):
+		copy_buffer = SlidingBuffer(self.atari_preprocessing, self.batch_size, self.buffer_size, self.device)
+		copy_buffer.curBufferInstance = copy.deepcopy(self.curBufferInstance)
+		copy_buffer.buffer = copy.copy(self.buffer)
+		copy_buffer.size = self.size
+
+		return copy_buffer
+
+	def add(self, state, action, next_state, reward, done, env_done, first_timestep):
+		self.curBufferInstance.add(state, action, next_state, reward, done, env_done, first_timestep)
+
+		if done != env_done:
+			return
+
+		# update last buffer instance's next state
+		if self.size > 0:
+			self.buffer[-1].next_state = self.curBufferInstance.state
+
+
+		self.buffer.append(copy.copy(self.curBufferInstance))
+		self.size += 1
+
+	def sample(self, size_override=None, with_indices=False):
+		old_size = self.batch_size
+		if size_override is not None:
+			self.batch_size = size_override
+
+		indices = np.random.randint(0, self.size, size=self.batch_size)
+
+		batch = [self.buffer[i] for i in indices]
+
+		batch_decomposed = (
+			torch.ByteTensor(np.array([single.state for single in batch])).to(self.device).float(),
+			torch.unsqueeze(torch.LongTensor(np.array([single.action for single in batch])), 1).to(self.device),
+			torch.ByteTensor(np.array([single.next_state for single in batch])).to(self.device).float(),
+			torch.unsqueeze(torch.FloatTensor(np.array([single.reward for single in batch])), 1).to(self.device),
+			torch.unsqueeze(torch.FloatTensor(np.array([single.not_done for single in batch])), 1).to(self.device)
+		)
+
+		if size_override is not None:
+			self.batch_size = old_size
+
+		if with_indices:
+			return batch, batch_decomposed, indices
+
+		return batch_decomposed
 
 
 class PrioritizedAtariBuffer(object):
@@ -213,8 +323,8 @@ class PrioritizedStandardBuffer():
 				torch.LongTensor(self.action[ind]).to(self.device),
 				torch.FloatTensor(self.next_state[ind]).to(self.device),
 				torch.FloatTensor(self.reward[ind]).to(self.device),
-				torch.FloatTensor(self.not_done[ind]).to(self.device),
-				torch.zeros(ind.shape).to(self.device)
+				torch.FloatTensor(self.not_done[ind]).to(self.device)# ,
+				# torch.zeros(ind.shape).to(self.device)
 			)
 
 		if self.prioritized:
