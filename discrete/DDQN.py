@@ -128,6 +128,32 @@ class DDQN(object):
 		self.iterations += 1
 		self.maybe_update_target()
 
+	def train_supervised(self, buffer_objects):
+		state, action, next_state, reward, done = buffer_objects
+		# Compute the target Q value
+		with torch.no_grad():
+			next_action = self.Q(next_state).argmax(1, keepdim=True)
+			target_Q = (
+					reward + done * self.discount * self.Q_target(next_state).gather(1, next_action).reshape(-1, 1)
+			)
+
+		# Get current Q estimate
+		current_Q = self.Q(state).gather(1, action)
+
+		# Compute Q loss
+		Q_loss = F.smooth_l1_loss(current_Q, target_Q)
+
+		# Optimize the Q network
+		self.Q_optimizer.zero_grad()
+		Q_loss.backward()
+		self.Q_optimizer.step()
+
+		# Update target network by polyak or full copy every X iterations.
+		self.iterations += 1
+		self.maybe_update_target()
+
+
+
 	def polyak_target_update(self):
 		for param, target_param in zip(self.Q.parameters(), self.Q_target.parameters()):
 			target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
@@ -137,13 +163,13 @@ class DDQN(object):
 			self.Q_target.load_state_dict(self.Q.state_dict())
 
 	def save(self, filename):
-		torch.save(self.iterations, filename + "iterations")
+		torch.save(self.iterations, filename + f"{self.iterations}_iterations")
 		torch.save(self.Q.state_dict(), f"{filename}Q_{self.iterations}")
 		torch.save(self.Q_optimizer.state_dict(), filename + "optimizer")
 
 	def load(self, filename, iters):
 		if torch.cuda.is_available():
-			self.iterations = torch.load(filename + "iterations")
+			self.iterations = torch.load(f"{filename}{iters}_iterations")
 			self.Q.load_state_dict(torch.load(f"{filename}Q_{iters}"))
 			self.Q_target = copy.deepcopy(self.Q)
 			self.Q_optimizer.load_state_dict(torch.load(filename + "optimizer"))

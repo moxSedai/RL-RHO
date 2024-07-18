@@ -95,10 +95,14 @@ class SlidingBuffer(object):
 		self.buffer.append(copy.copy(self.curBufferInstance))
 		self.size += 1
 
-	def sample(self, size_override=None, with_indices=False):
+	def sample(self, size_override=None, with_indices=False, device_override=None):
 		old_size = self.batch_size
 		if size_override is not None:
 			self.batch_size = size_override
+
+		if device_override is not None:
+			old_device = self.device
+			self.device = device_override
 
 		indices = np.random.randint(0, self.size, size=self.batch_size)
 
@@ -114,6 +118,9 @@ class SlidingBuffer(object):
 
 		if size_override is not None:
 			self.batch_size = old_size
+
+		if device_override is not None:
+			self.device = old_device
 
 		if with_indices:
 			return batch, batch_decomposed, indices
@@ -173,9 +180,13 @@ class PrioritizedAtariBuffer(object):
 			self.tree.set(self.ptr, self.max_priority)
 
 
-	def sample(self, size_override=None, with_indices = False):
+	def sample(self, size_override=None, with_indices = False, device_override=None):
 		if with_indices:
 			indices = []
+
+		if device_override is not None:
+			old_device = self.device
+			self.device = device_override
 
 		old_size = self.batch_size
 		if size_override is not None:
@@ -242,6 +253,9 @@ class PrioritizedAtariBuffer(object):
 
 		if size_override is not None:
 			self.batch_size = old_size
+
+		if device_override is not None:
+			self.device = old_device
 
 		if with_indices:
 			return batch, indices
