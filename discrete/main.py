@@ -42,10 +42,15 @@ def supervised_learning(env, pretrained_names, coreset_size, coreset_batch_size,
 
 	# Load holdout policy and buffer
 	replay_buffer = None
+	print("Loading buffer...", end='')
 	with open(f"{pretrained_names[1]}", 'rb') as f:
 		replay_buffer = pickle.load(f)
-		print("loaded buffer")
-	holdout_policy.load(f"{pretrained_names[0]}")
+		print("loaded!")
+	holdout_policy.load(f"{pretrained_names[0]}", 832500)
+
+
+	# Get true coreset size
+	coreset_size = coreset_size * len(replay_buffer.buffer)
 
 	# Setup coreset tracker
 	coreset_set = set()
@@ -54,68 +59,116 @@ def supervised_learning(env, pretrained_names, coreset_size, coreset_batch_size,
 	evaluations = []
 	start_time = time.time()
 
+	calc_losses = True
+
 	# Get the holdout loss for all experiences in the replay buffer
-	holdout_loss = []
-	for slide in replay_buffer.buffer:
-		state, action, next_state, reward, done = slide
-		# Compute the target Q value for the holdout policy
+	if calc_losses:
+		loss_calc_batch_size = 512
+		num_batches = len(replay_buffer.buffer) // loss_calc_batch_size
+		if len(replay_buffer.buffer) % loss_calc_batch_size != 0:
+			num_batches += 1
+		holdout_loss = torch.empty(0)
+
+		print(f"Calculating holdout loss...(0/{num_batches})", end='')
 		with torch.no_grad():
-			holdout_next_action = holdout_policy.Q(next_state).argmax(1, keepdim=True)
-			holdout_target_Q = (
-					reward + done * holdout_policy.discount *
-					holdout_policy.Q_target(next_state).gather(1, holdout_next_action).reshape(-1, 1)
-			)
-		# Compute the current Q estimate for the holdout policy
-		holdout_current_Q = holdout_policy.Q(state).gather(1, action)
-		holdout_Q_loss = F.smooth_l1_loss(holdout_current_Q, holdout_target_Q, reduce=False)
-		holdout_loss.append(holdout_Q_loss)
+			for i in range(num_batches):
+				batch = replay_buffer.buffer[i * loss_calc_batch_size: min((i + 1) * loss_calc_batch_size, len(replay_buffer.buffer))]
+				batch_elements = (
+					torch.ByteTensor(np.array([single.state for single in batch])).to(device).float(),
+					torch.unsqueeze(torch.LongTensor(np.array([single.action for single in batch])), 1).to(device),
+					torch.ByteTensor(np.array([single.next_state for single in batch])).to(device).float(),
+					torch.unsqueeze(torch.FloatTensor(np.array([single.reward for single in batch])), 1).to(device),
+					torch.unsqueeze(torch.FloatTensor(np.array([single.not_done for single in batch])), 1).to(device)
+				)
+				state, action, next_state, reward, done = batch_elements
+				# Compute the target Q value for the holdout policy
+				with torch.no_grad():
+					holdout_next_action = holdout_policy.Q(next_state).argmax(1, keepdim=True)
+					holdout_target_Q = (
+							reward + done * holdout_policy.discount *
+							holdout_policy.Q_target(next_state).gather(1, holdout_next_action).reshape(-1, 1)
+					)
+				# Compute the current Q estimate for the holdout policy
+				holdout_current_Q = holdout_policy.Q(state).gather(1, action)
+				holdout_Q_loss = F.smooth_l1_loss(holdout_current_Q, holdout_target_Q, reduce=False)
+				holdout_loss = torch.concatenate((holdout_loss, holdout_Q_loss.cpu()))
+				print(f"\rCalculating holdout loss...({i+1}/{num_batches})", end='')
+		torch.save(holdout_loss, f"./results/PongNoFrameskip-v0_250/holdout_loss")
+
+
+	else:
+		print("Loading loss...", end='')
+		holdout_loss = torch.load(f"./results/PongNoFrameskip-v0_250/holdout_loss")
+		print("loaded!")
 
 	# Training loop of policy
 	for t in range(max_epochs):
 		epoch_coreset_set = set()
 		while len(epoch_coreset_set) < coreset_size:
 			# Sample a batch from the replay buffer
-			sample_objects, sample, indices = replay_buffer.sample(coreset_batch_size, with_indices=True)
+			sample_objects, sample, indices = replay_buffer.sample(coreset_batch_size, with_indices=True, device_override=device)
+			state, action, next_state, reward, done = sample
 
 			# Get online loss for all experiences in the batch
-			online_loss = []
-			for slide in sample_objects:
-				state, action, next_state, reward, done = slide
-				# Compute the target Q value for the main policy
-				with torch.no_grad():
-					next_action = policy.Q(next_state).argmax(1, keepdim=True)
-					target_Q = (
-							reward + done * policy.discount *
-							policy.Q_target(next_state).gather(1, next_action).reshape(-1, 1)
-					)
-				# Compute the current Q estimate for the main policy
-				current_Q = policy.Q(state).gather(1, action)
-				Q_loss = F.smooth_l1_loss(current_Q, target_Q, reduce=False)
-				online_loss.append(Q_loss)
+			online_loss = torch.empty(0)
+
+			# Compute the target Q value for the main policy
+			with torch.no_grad():
+				next_action = policy.Q(next_state).argmax(1, keepdim=True)
+				target_Q = (
+						reward + done * policy.discount *
+						policy.Q_target(next_state).gather(1, next_action).reshape(-1, 1)
+				)
+
+			# Compute the current Q estimate for the main policy
+			current_Q = policy.Q(state).gather(1, action)
+			Q_loss = F.smooth_l1_loss(current_Q, target_Q, reduce=False)
+			online_loss = torch.concatenate((online_loss, Q_loss.cpu()))
 
 			# Get the rho loss by taking the differences
-			rho_loss = [holdout_loss[i] - online_loss[i] for i in indices]
+			rho_loss = online_loss - holdout_loss[indices]
 
 			# Sort the experiences based on the rho_loss in descending order
 			order = torch.argsort(rho_loss, 0).flip(0)
+			order_list = order.cpu().numpy().flatten()
 
 			# Determine how many experiences to add to the coreset in this iteration
-			num_to_add = min(len(epoch_coreset_set), add_count)
+			num_to_add = int(min(coreset_size - len(epoch_coreset_set), add_count))
 
+			# Reorder samples
+			sample = (
+				sample[0][order_list[:add_count]],
+				sample[1][order_list[:add_count]],
+				sample[2][order_list[:add_count]],
+				sample[3][order_list[:add_count]],
+				sample[4][order_list[:add_count]]
+			)
+
+			num_added = 0
+			num_full_added = 0
 			# Train new experiences to coresets
 			for i in range(num_to_add):
 				# Add the top un-added experiences to the epoch coreset_set (don't allow for duplicates)
 				if not indices[order[i]] in epoch_coreset_set:
 					epoch_coreset_set.add(indices[order[i]])
+					num_added += 1
 					if not indices[order[i]] in coreset_set:
 						coreset_set.add(indices[order[i]])
+						num_full_added += 1
 
 			# Train on this chosen batch
-			policy.train_supervised(sample[indices[order[:num_to_add]]])
+			policy.train_supervised(sample)
+
+			print(f"\rEpoch: {t}\t\tEpoch Coreset Size: {100.*len(epoch_coreset_set)/len(replay_buffer.buffer):.5f}% ({num_added})\t\tFull Coreset Size: {100.*len(coreset_set)/len(replay_buffer.buffer):.5f}% ({num_full_added})", end='')
+
 
 		# Evaluate after each epoch
 		elapsed_time = time.time() - start_time
 		evaluations.append(eval_policy(policy, args.env, args.seed, timer=elapsed_time))
+		plt.scatter(range(len(evaluations)), evaluations)
+		plt.title(f"Supervised Training {args.env} {args.seed} {time.time()-start_time}")
+		plt.show()
+
 
 
 
@@ -302,6 +355,13 @@ def normal_training(env, replay_buffer, args, kwargs):
 			policy.save(f"./results/{args.env}_{args.seed}/holdout")
 			with open(f"./results/{args.env}_{args.seed}/intermediary_buffer_{policy.iterations}.pkl", 'wb') as f:
 				pickle.dump(replay_buffer, f)
+			policy.save(f"./results/{args.env}_{args.seed}/holdout")
+			with open(f"./results/{args.env}_{args.seed}/intermediary_buffer_{policy.iterations}.pkl", 'wb') as f:
+				pickle.dump(replay_buffer, f)
+			plt.scatter(range(len(evaluations)), evaluations)
+			plt.title(f"Normal Training Evaluation Rewards over epochs Seed:{args.seed} iter:{policy.iterations}")
+			plt.savefig(f"./results/{args.env}_{args.seed}/output_policy_{args.env}_{args.seed}_{policy.iterations}.png")
+			plt.close()
 	plt.scatter(range(len(evaluations)), evaluations)
 	plt.title(f"Normal Training Evaluation Rewards over epochs {time.time() - start_time}")
 	plt.show()
@@ -310,11 +370,12 @@ def normal_training(env, replay_buffer, args, kwargs):
 		pickle.dump(replay_buffer, f)
 
 
-
 def rho_training(env, replay_buffer, holdout_replay_buffer, coreset_base, coreset_freq, coreset_size, coreset_batch_size, coreset_add_size, args, kwargs, slide, name='', ):
 	# Setup for training
 	policy = DDQN.DDQN(**kwargs)
 	holdout_policy = DDQN.DDQN(**kwargs)
+	# load holdout policy also when turning off TURN BACK ON SELECTING HOLDOUT POLICY
+	holdout_policy.load(f"./results/{args.env}_250/holdout", 832500)
 
 	kwargs["alpha"] = parameters["alpha"]
 	kwargs["min_priority"] = parameters["min_priority"]
@@ -348,12 +409,12 @@ def rho_training(env, replay_buffer, holdout_replay_buffer, coreset_base, corese
 
 
 		# Train the holdout policy for a number of steps first.
-		if t < parameters["holdout_timesteps"]:
-			policy_used = holdout_policy
-			holdout = True
+		# if t < parameters["holdout_timesteps"]:
+		# 	policy_used = holdout_policy
+		# 	holdout = True
 
 		# Get value to split between main and holdout policy
-		elif random.randint(0, 4) != 0:
+		if random.randint(0, 4) != -1:  # MAKE SURE TO RESET TO != 0 IF NOT USING PRETRAINED
 			# Copy buffer state over if switching from holdout
 			if holdout:
 				replay_buffer.curBufferInstance = copy.copy(holdout_replay_buffer.curBufferInstance)
@@ -492,6 +553,11 @@ def main(env, replay_buffer, is_atari, state_dim, num_actions, args, parameters,
 		supervised_learning(env, pretrained_names, coreset_size, coreset_batch_size, coreset_add_size, 100, args, kwargs)
 
 	elif not rho:
+	if supervised:
+		pretrained_names = ["./results/PongNoFrameskip-v0_250/holdout", "./results/final_buffer_PongNoFrameskip-v0_250.pkl"]
+		supervised_learning(env, pretrained_names, coreset_size, coreset_batch_size, coreset_add_size, 10000, args, kwargs)
+
+	elif not rho:
 		normal_training(env, replay_buffer, args, kwargs)
 	else:
 		rho_training(env, replay_buffer, rho_buffer, coreset_base, coreset_freq, coreset_size, coreset_batch_size, coreset_add_size, args, kwargs, f"{coreset_freq} {coreset_size}")
@@ -536,14 +602,15 @@ if __name__ == "__main__":
 	logger.info("Starting main.py")
 	sys.stdout = PrintToLog()
 
+	device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 	supervised = False
 	# Set Rho Parameters
 	rho = False
-	coreset_size = 0.8
+	coreset_size = 0.2
 	coreset_batch_size = 512
 	coreset_add_size = 16
-	coreset_freq = 75000
+	coreset_freq = 25000
 
 	# Atari Specific
 	atari_preprocessing = {
@@ -616,13 +683,13 @@ if __name__ == "__main__":
 	parser.add_argument("--algorithm", default="DDQN")				# OpenAI gym environment name
 	# parser.add_argument("--env", default="CartPole-v1")		# OpenAI gym environment name #PongNoFrameskip-v0
 	parser.add_argument("--env", default="PongNoFrameskip-v0")  # OpenAI gym environment name #PongNoFrameskip-v0
-	parser.add_argument("--seed", default=250, type=int)				# Sets Gym, PyTorch and Numpy seeds
+	parser.add_argument("--seed", default=2000, type=int)				# Sets Gym, PyTorch and Numpy seeds
 	parser.add_argument("--buffer_name", default="Default")			# Prepends name to filename
-	parser.add_argument("--max_timesteps", default=50e6, type=int)	# Max time steps to run environment or train for
+	parser.add_argument("--max_timesteps", default=5e6, type=int)	# Max time steps to run environment or train for
 	args = parser.parse_args()
 
 	print("---------------------------------------")	
-	print(f"Setting: Algorithm: {args.algorithm}, Env: {args.env}, Seed: {args.seed}")
+	print(f"Setting: Algorithm: {args.algorithm}, Env: {args.env}, Seed: {args.seed}, Device: {device}")
 	print("---------------------------------------")
 
 	setting = f"{args.algorithm}_{args.env}_{args.seed}"
@@ -660,7 +727,7 @@ if __name__ == "__main__":
 	)
 
 	if supervised:
-		main(env, replay_buffer, is_atari, state_dim, num_actions, args, parameters, device)
+		main(env, replay_buffer, is_atari, state_dim, num_actions, args, parameters, device, coreset_size=coreset_size, coreset_batch_size=coreset_batch_size, coreset_add_size=coreset_add_size)
 
 
 	elif rho:
