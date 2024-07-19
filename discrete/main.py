@@ -353,11 +353,9 @@ def normal_training(env, replay_buffer, args, kwargs):
 			evaluations.append(eval_policy(policy, args.env, args.seed, timer=elapsed_time))
 			np.save(f"./results/{setting}.npy", evaluations)
 			policy.save(f"./results/{args.env}_{args.seed}/holdout")
-			with open(f"./results/{args.env}_{args.seed}/intermediary_buffer_{policy.iterations}.pkl", 'wb') as f:
-				pickle.dump(replay_buffer, f)
-			policy.save(f"./results/{args.env}_{args.seed}/holdout")
-			with open(f"./results/{args.env}_{args.seed}/intermediary_buffer_{policy.iterations}.pkl", 'wb') as f:
-				pickle.dump(replay_buffer, f)
+			if (t + 1) % 1000000 == 0:
+				with open(f"./results/{args.env}_{args.seed}/intermediary_buffer_{policy.iterations}.pkl", 'wb') as f:
+					pickle.dump(replay_buffer, f)
 			plt.scatter(range(len(evaluations)), evaluations)
 			plt.title(f"Normal Training Evaluation Rewards over epochs Seed:{args.seed} iter:{policy.iterations}")
 			plt.savefig(f"./results/{args.env}_{args.seed}/output_policy_{args.env}_{args.seed}_{policy.iterations}.png")
@@ -549,13 +547,10 @@ def main(env, replay_buffer, is_atari, state_dim, num_actions, args, parameters,
 	}
 
 	if supervised:
-		pretrained_names = ["./results/policyThingyPong_3", "./results/final_buffer_PongNoFrameskip-v0_3.pkl"]
-		supervised_learning(env, pretrained_names, coreset_size, coreset_batch_size, coreset_add_size, 100, args, kwargs)
-
-	elif not rho:
-	if supervised:
-		pretrained_names = ["./results/PongNoFrameskip-v0_250/holdout", "./results/final_buffer_PongNoFrameskip-v0_250.pkl"]
-		supervised_learning(env, pretrained_names, coreset_size, coreset_batch_size, coreset_add_size, 10000, args, kwargs)
+		pretrained_names = ["./results/PongNoFrameskip-v0_250/holdout",
+							"./results/final_buffer_PongNoFrameskip-v0_250.pkl"]
+		supervised_learning(env, pretrained_names, coreset_size, coreset_batch_size, coreset_add_size, 10000, args,
+							kwargs)
 
 	elif not rho:
 		normal_training(env, replay_buffer, args, kwargs)
@@ -685,7 +680,7 @@ if __name__ == "__main__":
 	parser.add_argument("--env", default="PongNoFrameskip-v0")  # OpenAI gym environment name #PongNoFrameskip-v0
 	parser.add_argument("--seed", default=2000, type=int)				# Sets Gym, PyTorch and Numpy seeds
 	parser.add_argument("--buffer_name", default="Default")			# Prepends name to filename
-	parser.add_argument("--max_timesteps", default=5e6, type=int)	# Max time steps to run environment or train for
+	parser.add_argument("--max_timesteps", default=50e6, type=int)	# Max time steps to run environment or train for
 	args = parser.parse_args()
 
 	print("---------------------------------------")	
