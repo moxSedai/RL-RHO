@@ -7,8 +7,8 @@ import copy
 
 def ReplayBuffer(state_dim, prioritized, is_atari, atari_preprocessing, batch_size, buffer_size, device):
 	if is_atari:
-		return SlidingBuffer(atari_preprocessing, batch_size, buffer_size, device)
-		# return PrioritizedAtariBuffer(state_dim, atari_preprocessing, batch_size, buffer_size, device, prioritized)
+		# return SlidingBuffer(atari_preprocessing, batch_size, buffer_size, device)
+		return PrioritizedAtariBuffer(state_dim, atari_preprocessing, batch_size, buffer_size, device, prioritized)
 	else: 
 		return PrioritizedStandardBuffer(state_dim, batch_size, buffer_size, device, prioritized)
 

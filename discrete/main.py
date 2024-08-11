@@ -21,6 +21,30 @@ import LAP_DDQN
 import PAL_DDQN
 import utils
 
+# todo run staggered (train 25/50/whatever, use as holdout for new network train 25, repeat with new network repeatedly)
+	# todo check training each new network for longer
+	# todo check train with RL then save coreset buffer -> supervised train -> use as holdout for RL/supervised
+# todo run games from DQN paper
+# todo Email update monday with figures
+
+
+
+# todo look at state of the art for quickly training RL.  Think: PER, is there something better than it now?  See who cites them
+# todo rerun coreset supervised
+# todo run fixed-size coreset RL training
+# todo look at fujimoto's papers and what he cites
+# todo email update monday morning
+
+
+
+# todo look at different combinations of frequency and coreset size.  Look at fixed coreset size
+# --todo optimize hyperparameters (primarily how often to coreset)
+# todo pick earlier versions of policy to train on them and see how well training on them works
+# -- todo train supervised without coresetting
+# todo more supervised stuff
+# todo supervised on coreset, keep track of distribution of where in the buffer they are from.  Potential histogram of iterator in coreset
+
+
 
 # Class to log print statements
 class PrintToLog:
@@ -46,10 +70,11 @@ def supervised_learning(env, pretrained_names, coreset_size, coreset_batch_size,
 	with open(f"{pretrained_names[1]}", 'rb') as f:
 		replay_buffer = pickle.load(f)
 		print("loaded!")
-	holdout_policy.load(f"{pretrained_names[0]}", 832500)
+	holdout_policy.load(f"{pretrained_names[0]}", 320000)
 
 
 	# Get true coreset size
+	coreset_percent = coreset_size
 	coreset_size = coreset_size * len(replay_buffer.buffer)
 
 	# Setup coreset tracker
@@ -59,7 +84,7 @@ def supervised_learning(env, pretrained_names, coreset_size, coreset_batch_size,
 	evaluations = []
 	start_time = time.time()
 
-	calc_losses = True
+	calc_losses = False
 
 	# Get the holdout loss for all experiences in the replay buffer
 	if calc_losses:
@@ -93,12 +118,12 @@ def supervised_learning(env, pretrained_names, coreset_size, coreset_batch_size,
 				holdout_Q_loss = F.smooth_l1_loss(holdout_current_Q, holdout_target_Q, reduce=False)
 				holdout_loss = torch.concatenate((holdout_loss, holdout_Q_loss.cpu()))
 				print(f"\rCalculating holdout loss...({i+1}/{num_batches})", end='')
-		torch.save(holdout_loss, f"./results/PongNoFrameskip-v0_250/holdout_loss")
+		torch.save(holdout_loss, f"./results/PongNoFrameskip-v0_2000/holdout_loss")
 
 
 	else:
 		print("Loading loss...", end='')
-		holdout_loss = torch.load(f"./results/PongNoFrameskip-v0_250/holdout_loss")
+		holdout_loss = torch.load(f"./results/PongNoFrameskip-v0_2000/holdout_loss")
 		print("loaded!")
 
 	# Training loop of policy
@@ -166,14 +191,186 @@ def supervised_learning(env, pretrained_names, coreset_size, coreset_batch_size,
 		elapsed_time = time.time() - start_time
 		evaluations.append(eval_policy(policy, args.env, args.seed, timer=elapsed_time))
 		plt.scatter(range(len(evaluations)), evaluations)
-		plt.title(f"Supervised Training {args.env} {args.seed} {time.time()-start_time}")
-		plt.show()
+		plt.title(f"Supervised Training {args.env} {args.seed} ({coreset_batch_size}/{coreset_add_size}) {100*coreset_percent}")
+		plt.savefig(f"./results/{args.env}_{args.seed}_Supervised_{args.env}_{args.seed}_{len(evaluations)}_({coreset_batch_size}_{coreset_add_size})_{100*coreset_percent}.png")
+		plt.close()
 
 
 
 
+def supervised_single_coreset(env, pretrained_names, coreset_size, coreset_batch_size, add_count, max_epochs, args, kwargs):
+	# Create policy
+	policy = DDQN.DDQN(**kwargs)
+	holdout_policy = DDQN.DDQN(**kwargs)
 
 
+
+	its_per_eval = 10000
+
+	# Load holdout policy and buffer
+	replay_buffer = None
+	print("Loading buffer...", end='')
+	with open(f"{pretrained_names[1]}", 'rb') as f:
+		replay_buffer = pickle.load(f)
+		print("loaded!")
+	holdout_policy.load(f"{pretrained_names[0]}", 1957500)
+
+
+	# Get true coreset size
+	coreset_percent = coreset_size
+
+	if not os.path.exists(
+			f"./results/{args.env}_{args.seed}/_Supervised_({coreset_batch_size}_{coreset_add_size})_{100*coreset_percent}"):
+		os.makedirs(f"./results/{args.env}_{args.seed}/_Supervised_({coreset_batch_size}_{coreset_add_size})_{100*coreset_percent}")
+
+
+	coreset_size = coreset_size * len(replay_buffer.buffer)
+
+	# Setup coreset tracker
+	coreset_set = set()
+
+	# Setup for training
+	evaluations = []
+	start_time = time.time()
+
+	calc_losses = False
+
+	# Get the holdout loss for all experiences in the replay buffer
+	if calc_losses:
+		loss_calc_batch_size = 512
+		num_batches = len(replay_buffer.buffer) // loss_calc_batch_size
+		if len(replay_buffer.buffer) % loss_calc_batch_size != 0:
+			num_batches += 1
+		holdout_loss = torch.empty(0)
+
+		print(f"Calculating holdout loss...(0/{num_batches})", end='')
+		with torch.no_grad():
+			for i in range(num_batches):
+				batch = replay_buffer.buffer[i * loss_calc_batch_size: min((i + 1) * loss_calc_batch_size, len(replay_buffer.buffer))]
+				batch_elements = (
+					torch.ByteTensor(np.array([single.state for single in batch])).to(device).float(),
+					torch.unsqueeze(torch.LongTensor(np.array([single.action for single in batch])), 1).to(device),
+					torch.ByteTensor(np.array([single.next_state for single in batch])).to(device).float(),
+					torch.unsqueeze(torch.FloatTensor(np.array([single.reward for single in batch])), 1).to(device),
+					torch.unsqueeze(torch.FloatTensor(np.array([single.not_done for single in batch])), 1).to(device)
+				)
+				state, action, next_state, reward, done = batch_elements
+				# Compute the target Q value for the holdout policy
+				with torch.no_grad():
+					holdout_next_action = holdout_policy.Q(next_state).argmax(1, keepdim=True)
+					holdout_target_Q = (
+							reward + done * holdout_policy.discount *
+							holdout_policy.Q_target(next_state).gather(1, holdout_next_action).reshape(-1, 1)
+					)
+				# Compute the current Q estimate for the holdout policy
+				holdout_current_Q = holdout_policy.Q(state).gather(1, action)
+				holdout_Q_loss = F.smooth_l1_loss(holdout_current_Q, holdout_target_Q, reduce=False)
+				holdout_loss = torch.concatenate((holdout_loss, holdout_Q_loss.cpu()))
+				print(f"\rCalculating holdout loss...({i+1}/{num_batches})", end='')
+		torch.save(holdout_loss, f"./results/PongNoFrameskip-v0_2000/holdout_loss")
+
+
+	else:
+		print("Loading loss...", end='')
+		holdout_loss = torch.load(f"./results/PongNoFrameskip-v0_2000/holdout_loss")
+		print("loaded!")
+
+	# Training loop of policy
+	for t in range(max_epochs):
+		# Sample a batch from the replay buffer
+		sample_objects, sample, indices = replay_buffer.sample(coreset_batch_size, with_indices=True, device_override=device)
+		state, action, next_state, reward, done = sample
+		# Get online loss for all experiences in the batch
+		online_loss = torch.empty(0)
+		# Compute the target Q value for the main policy
+		with torch.no_grad():
+			next_action = policy.Q(next_state).argmax(1, keepdim=True)
+			target_Q = (
+					reward + done * policy.discount *
+					policy.Q_target(next_state).gather(1, next_action).reshape(-1, 1)
+			)
+		# Compute the current Q estimate for the main policy
+		current_Q = policy.Q(state).gather(1, action)
+		Q_loss = F.smooth_l1_loss(current_Q, target_Q, reduce=False)
+		online_loss = torch.concatenate((online_loss, Q_loss.cpu()))
+		# Get the rho loss by taking the differences
+		rho_loss = online_loss - holdout_loss[indices]
+		# Sort the experiences based on the rho_loss in descending order
+		order = torch.argsort(rho_loss, 0).flip(0)
+		order_list = order.cpu().numpy().flatten()
+		# Determine how many experiences to add to the coreset in this iteration
+		num_to_add = int(min(coreset_size - len(coreset_set), add_count))
+		# Reorder samples
+		sample = (
+			sample[0][order_list[:add_count]],
+			sample[1][order_list[:add_count]],
+			sample[2][order_list[:add_count]],
+			sample[3][order_list[:add_count]],
+			sample[4][order_list[:add_count]]
+		)
+		num_added = 0
+		num_full_added = 0
+		# Train new experiences to coresets
+		for i in range(num_to_add):
+			# Add the top un-added experiences to the epoch coreset_set (don't allow for duplicates)
+			if not indices[order[i]] in coreset_set:
+				coreset_set.add(indices[order[i]])
+				num_full_added += 1
+		# Train on this chosen batch
+		policy.train_supervised(sample)
+		print(f"\rEpoch: {t}\t\tCoreset Size: {100.*len(coreset_set)/len(replay_buffer.buffer):.5f}% ({num_full_added})", end='')
+
+		if t % its_per_eval == 0:
+			# Evaluate after each epoch
+			elapsed_time = time.time() - start_time
+			evaluations.append(eval_policy(policy, args.env, args.seed, timer=elapsed_time))
+			plt.scatter(range(len(evaluations)), evaluations)
+			plt.title(f"Supervised Training {args.env} {args.seed} ({coreset_batch_size}/{coreset_add_size}) {100*coreset_percent}")
+			plt.savefig(f"./results/{args.env}_{args.seed}/_Supervised_({coreset_batch_size}_{coreset_add_size})_{100*coreset_percent}/plot_{len(evaluations)}.png")
+			plt.close()
+
+
+
+def supervised_no_coreset(env, pretrained_names, batch_size, max_epochs, args, kwargs):
+	# Create policy
+	policy = DDQN.DDQN(**kwargs)
+	holdout_policy = DDQN.DDQN(**kwargs)
+
+	its_per_eval = 10000
+
+	# Load holdout policy and buffer
+	replay_buffer = None
+	print("Loading buffer...", end='')
+	with open(f"{pretrained_names[1]}", 'rb') as f:
+		replay_buffer = pickle.load(f)
+		print("loaded!")
+	holdout_policy.load(f"{pretrained_names[0]}", 1495000)
+
+	# Setup coreset tracker
+	coreset_set = set()
+
+	# Setup for training
+	evaluations = []
+	start_time = time.time()
+
+	# Training loop of policy
+	for t in range(max_epochs):
+		# Sample a batch from the replay buffer
+		# todo change sample to going through entire buffer with shuffled indices
+		sample_objects, sample, indices = replay_buffer.sample(coreset_batch_size, with_indices=True, device_override=device)
+		state, action, next_state, reward, done = sample
+
+		# Train on this chosen batch
+		policy.train_supervised(sample)
+
+		if t % its_per_eval == 0:
+			# Evaluate after each epoch
+			elapsed_time = time.time() - start_time
+			evaluations.append(eval_policy(policy, args.env, args.seed, timer=elapsed_time))
+			plt.scatter(range(len(evaluations)), evaluations)
+			plt.title(f"Supervised Training {args.env} {args.seed} ({coreset_batch_size}/{coreset_add_size})")
+			plt.savefig(f"./results/{args.env}_{args.seed}_Supervised_{args.env}_{args.seed}_{len(evaluations)}_({coreset_batch_size}_{coreset_add_size}).png")
+			plt.close()
 
 
 
@@ -199,7 +396,7 @@ def coreset(policy, holdout_policy, replay_buffer, holdout_buffer, coreset_base,
 	coreset_indices_set = set()
 
 	# Convert the coreset_size from a percentage to an absolute number based on the size of the replay buffer
-	coreset_size = int(replay_buffer.size * coreset_size)
+	# coreset_size = int(replay_buffer.size * coreset_size)
 	coreset.size = coreset_size
 
 
@@ -351,19 +548,19 @@ def normal_training(env, replay_buffer, args, kwargs):
 		if (t + 1) % parameters["eval_freq"] == 0:
 			elapsed_time = time.time() - start_time
 			evaluations.append(eval_policy(policy, args.env, args.seed, timer=elapsed_time))
-			np.save(f"./results/{setting}.npy", evaluations)
-			policy.save(f"./results/{args.env}_{args.seed}/holdout")
+			np.save(f"./results/per/{setting}.npy", evaluations)
+			policy.save(f"./results/per/{args.env}_{args.seed}/holdout")
 			if (t + 1) % 1000000 == 0:
-				with open(f"./results/{args.env}_{args.seed}/intermediary_buffer_{policy.iterations}.pkl", 'wb') as f:
+				with open(f"./results/per/{args.env}_{args.seed}/intermediary_buffer_{policy.iterations}.pkl", 'wb') as f:
 					pickle.dump(replay_buffer, f)
-			plt.scatter(range(len(evaluations)), evaluations)
+			plt.scatter(range(len(evaluations)), evaluations*50000)
 			plt.title(f"Normal Training Evaluation Rewards over epochs Seed:{args.seed} iter:{policy.iterations}")
-			plt.savefig(f"./results/{args.env}_{args.seed}/output_policy_{args.env}_{args.seed}_{policy.iterations}.png")
+			plt.savefig(f"./results/per/{args.env}_{args.seed}/output_policy_{args.env}_{args.seed}_{policy.iterations}.png")
 			plt.close()
 	plt.scatter(range(len(evaluations)), evaluations)
 	plt.title(f"Normal Training Evaluation Rewards over epochs {time.time() - start_time}")
 	plt.show()
-	policy.save(f"./results/{args.env}_{args.seed}/output_policy_{args.env}_{args.seed}")
+	policy.save(f"./results/per/{args.env}_{args.seed}/output_policy_{args.env}_{args.seed}")
 	with open(f"final_buffer_{args.env}_{args.seed}.pkl", 'wb') as f:
 		pickle.dump(replay_buffer, f)
 
@@ -373,7 +570,7 @@ def rho_training(env, replay_buffer, holdout_replay_buffer, coreset_base, corese
 	policy = DDQN.DDQN(**kwargs)
 	holdout_policy = DDQN.DDQN(**kwargs)
 	# load holdout policy also when turning off TURN BACK ON SELECTING HOLDOUT POLICY
-	holdout_policy.load(f"./results/{args.env}_250/holdout", 832500)
+	holdout_policy.load(f"./results/{args.env}_1000/holdout", 1495000)
 
 	kwargs["alpha"] = parameters["alpha"]
 	kwargs["min_priority"] = parameters["min_priority"]
@@ -506,8 +703,13 @@ def rho_training(env, replay_buffer, holdout_replay_buffer, coreset_base, corese
 			elapsed_time = time.time() - start_time
 			evaluations.append(eval_policy(policy, args.env, args.seed, timer=elapsed_time))
 			np.save(f"./results/{setting}.npy", evaluations)
-			policy.save(f"./results/policyThingyPong")
+			policy.save(f"./results/{args.env}_{args.seed}/rho_{100*coreset_size}_{coreset_add_size}_{coreset_batch_size}_{coreset_freq}/policy_")
 			print("Total T | Episode Num | Episode T | Reward | Buffer Size | Holdout Buffer Size")
+			plt.scatter(range(len(evaluations)), evaluations*50000)
+			plt.title(f"Rho Training Seed:{args.seed} {100*coreset_size}% Coreset ({coreset_add_size}/{coreset_batch_size}) {coreset_freq} freq; iter:{policy.iterations}")
+			plt.savefig(
+				f"./results/{args.env}_{args.seed}/rho_{100*coreset_size}_{coreset_add_size}_{coreset_batch_size}_{coreset_freq}/rho_output_policy_{args.env}_{args.seed}_{100*coreset_size}%_Coreset_({coreset_add_size}_{coreset_batch_size})_{coreset_freq}_freq_{policy.iterations}.png")
+			plt.close()
 
 		# Create coreset
 		if t > 0 and t % coreset_freq == 0 and t > parameters["holdout_timesteps"]:
@@ -547,10 +749,13 @@ def main(env, replay_buffer, is_atari, state_dim, num_actions, args, parameters,
 	}
 
 	if supervised:
-		pretrained_names = ["./results/PongNoFrameskip-v0_250/holdout",
-							"./results/final_buffer_PongNoFrameskip-v0_250.pkl"]
-		supervised_learning(env, pretrained_names, coreset_size, coreset_batch_size, coreset_add_size, 10000, args,
+		pretrained_names = ["./results/PongNoFrameskip-v0_2000/holdout",
+							"./results/PongNoFrameskip-v0_1000/intermediary_buffer_1745000.pkl"]
+		if rho:
+			supervised_single_coreset(env, pretrained_names, coreset_size, coreset_batch_size, coreset_add_size, 10000000, args,
 							kwargs)
+		else:
+			supervised_no_coreset(env, pretrained_names, coreset_batch_size, 10000000, args, kwargs)
 
 	elif not rho:
 		normal_training(env, replay_buffer, args, kwargs)
@@ -597,15 +802,15 @@ if __name__ == "__main__":
 	logger.info("Starting main.py")
 	sys.stdout = PrintToLog()
 
-	device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+	device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
 	supervised = False
 	# Set Rho Parameters
 	rho = False
-	coreset_size = 0.2
+	coreset_size = 10000
 	coreset_batch_size = 512
 	coreset_add_size = 16
-	coreset_freq = 25000
+	coreset_freq = 75000
 
 	# Atari Specific
 	atari_preprocessing = {
@@ -675,10 +880,10 @@ if __name__ == "__main__":
 
 	# Load parameters
 	parser = argparse.ArgumentParser()
-	parser.add_argument("--algorithm", default="DDQN")				# OpenAI gym environment name
+	parser.add_argument("--algorithm", default="PER_DDQN")				# OpenAI gym environment name
 	# parser.add_argument("--env", default="CartPole-v1")		# OpenAI gym environment name #PongNoFrameskip-v0
 	parser.add_argument("--env", default="PongNoFrameskip-v0")  # OpenAI gym environment name #PongNoFrameskip-v0
-	parser.add_argument("--seed", default=2000, type=int)				# Sets Gym, PyTorch and Numpy seeds
+	parser.add_argument("--seed", default=0, type=int)				# Sets Gym, PyTorch and Numpy seeds
 	parser.add_argument("--buffer_name", default="Default")			# Prepends name to filename
 	parser.add_argument("--max_timesteps", default=50e6, type=int)	# Max time steps to run environment or train for
 	args = parser.parse_args()
@@ -689,11 +894,14 @@ if __name__ == "__main__":
 
 	setting = f"{args.algorithm}_{args.env}_{args.seed}"
 
-	if not os.path.exists("./results"):
-		os.makedirs("./results")
+	if not os.path.exists("./results/per"):
+		os.makedirs("./results/per")
 
-	if not os.path.exists(f"./results/{args.env}_{args.seed}"):
-		os.makedirs(f"./results/{args.env}_{args.seed}")
+	if not os.path.exists(f"./results/per/{args.env}_{args.seed}"):
+		os.makedirs(f"./results/per/{args.env}_{args.seed}")
+
+	if rho and not os.path.exists(f"./results/{args.env}_{args.seed}/rho_{100*coreset_size}_{coreset_add_size}_{coreset_batch_size}_{coreset_freq}"):
+		os.makedirs(f"./results/{args.env}_{args.seed}/rho_{100*coreset_size}_{coreset_add_size}_{coreset_batch_size}_{coreset_freq}")
 
 
 
